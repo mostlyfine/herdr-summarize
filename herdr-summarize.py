@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -19,13 +20,18 @@ CLAUDE_INTERNAL_PROMPT_MARKERS = (
     "<command-name>",
     "<local-command-stdout>",
 )
-SUMMARY_PROMPT = (
-    "Below (on stdin) is the recent transcript of a coding session between a User and an AI Assistant.\n"
+SUMMARY_PROMPT_TEMPLATE = (
+    "Below is the recent transcript of a coding session between a User and an AI Assistant.\n"
     "Summarize what the USER is trying to accomplish as a short, concise title: a phrase, NOT a full\n"
     "sentence — no trailing punctuation. Base it on the User's intent, not the Assistant's wording.\n"
     "Match the User's language.\n"
+    "Keep the title within {max_chars} characters.\n"
     "Output ONLY the title: no quotes, no labels, no explanation."
 )
+
+
+def summary_prompt(max_chars: int = MAX_SUMMARY_CHARS) -> str:
+    return SUMMARY_PROMPT_TEMPLATE.format(max_chars=max_chars)
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -140,8 +146,8 @@ def _truncate(text: str, max_chars: int) -> str:
     return text
 
 
-def truncate_summary(text: str) -> str:
-    return text[:MAX_SUMMARY_CHARS]
+def truncate_summary(text: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
+    return text[:max_chars]
 
 
 def _join_blocks(blocks: object, block_type: str) -> str:
@@ -269,7 +275,7 @@ def extract_recent_turns(turns: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def sanitize_summary(summary: str) -> str:
+def sanitize_summary(summary: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
     first_line = ""
     for line in summary.splitlines():
         stripped = line.strip()
@@ -284,7 +290,7 @@ def sanitize_summary(summary: str) -> str:
     cleaned = oneline(cleaned)
     if not cleaned:
         return ""
-    return truncate_summary(cleaned)
+    return truncate_summary(cleaned, max_chars)
 
 
 def get_copilot_transcript_path(session_id: str) -> Path | None:
@@ -348,15 +354,24 @@ def summary_environment() -> dict[str, str]:
     return environment
 
 
-def summarize_with_streaming_agent(agent: str, stop_input: str) -> str:
+def summarize_with_streaming_agent(
+    agent: str, stop_input: str, max_chars: int = MAX_SUMMARY_CHARS
+) -> str:
+    options = {
+        "claude": ["--model", "claude-haiku-4-5", "--output-format", "text", "--tools", ""],
+        "copilot": [
+            "--model", "gpt-5.6-luna", "--silent", "--stream", "off",
+            "--available-tools=", "--no-ask-user",
+        ],
+    }
     return run_quiet(
-        [agent, "-p", SUMMARY_PROMPT],
-        input_text=stop_input,
+        [agent, "-p", f"{summary_prompt(max_chars)}\n\n{stop_input}", *options[agent]],
+        input_text="",
         environment=summary_environment(),
     )
 
 
-def summarize_with_codex(stop_input: str) -> str:
+def summarize_with_codex(stop_input: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
     state_dir = summarize_state_dir()
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -376,8 +391,11 @@ def summarize_with_codex(stop_input: str) -> str:
             output_path = Path(handle.name)
 
         completed = subprocess.run(
-            ["codex", "exec", "--ephemeral", "--output-last-message", str(output_path), SUMMARY_PROMPT],
-            input=stop_input,
+            [
+                "codex", "exec", "--model", "gpt-5.6-luna", "--sandbox", "read-only",
+                "--skip-git-repo-check", "--ephemeral", "--output-last-message", str(output_path), "-",
+            ],
+            input=f"{summary_prompt(max_chars)}\n\n{stop_input}",
             env=summary_environment(),
             capture_output=True,
             text=True,
@@ -396,11 +414,11 @@ def summarize_with_codex(stop_input: str) -> str:
                 pass
 
 
-def summarize_with_agent(agent: str, stop_input: str) -> str:
+def summarize_with_agent(agent: str, stop_input: str, max_chars: int = MAX_SUMMARY_CHARS) -> str:
     summarizers = {
-        "codex": lambda: summarize_with_codex(stop_input),
-        "claude": lambda: summarize_with_streaming_agent(agent, stop_input),
-        "copilot": lambda: summarize_with_streaming_agent(agent, stop_input),
+        "codex": lambda: summarize_with_codex(stop_input, max_chars),
+        "claude": lambda: summarize_with_streaming_agent(agent, stop_input, max_chars),
+        "copilot": lambda: summarize_with_streaming_agent(agent, stop_input, max_chars),
     }
     summarizer = summarizers.get(agent)
     return summarizer() if summarizer is not None else ""
@@ -411,28 +429,33 @@ def is_internal_prompt(prompt: str) -> bool:
     return any(stripped.startswith(marker) for marker in CLAUDE_INTERNAL_PROMPT_MARKERS)
 
 
-def record_prompt(prompt: str) -> None:
-    report_metadata(f"prompt={truncate_summary(prompt)}")
+def record_prompt(prompt: str, max_chars: int = MAX_SUMMARY_CHARS) -> None:
+    report_metadata(f"prompt={truncate_summary(prompt, max_chars)}")
     save_last_prompt(prompt)
 
 
-def handle_prompt_submit(payload: dict) -> None:
+def handle_prompt_submit(payload: dict, max_chars: int = MAX_SUMMARY_CHARS) -> None:
     prompt = payload.get("prompt")
     if not isinstance(prompt, str) or not prompt or is_internal_prompt(prompt):
         return
 
-    record_prompt(prompt)
+    record_prompt(prompt, max_chars)
 
 
-def handle_stop_event(records: list[dict], agent: str | None) -> None:
-    if agent is None or not command_exists(agent):
+def handle_stop_event(
+    records: list[dict],
+    source_agent: str | None,
+    summary_agent: str = "copilot",
+    max_chars: int = MAX_SUMMARY_CHARS,
+) -> None:
+    if source_agent is None or not command_exists(summary_agent):
         return
 
-    turns = extract_turns(agent, records)
+    turns = extract_turns(source_agent, records)
 
     prompt = extract_latest_prompt(turns)
     if prompt:
-        record_prompt(prompt)
+        record_prompt(prompt, max_chars)
 
     content = extract_recent_turns(turns)
     if not content:
@@ -440,8 +463,8 @@ def handle_stop_event(records: list[dict], agent: str | None) -> None:
 
     report_metadata("summary=...")
     stop_input = build_stop_input(load_last_prompt(), content)
-    summary = summarize_with_agent(agent, stop_input)
-    sanitized = sanitize_summary(summary)
+    summary = summarize_with_agent(summary_agent, stop_input, max_chars)
+    sanitized = sanitize_summary(summary, max_chars)
     if not sanitized:
         return
 
@@ -486,7 +509,9 @@ def rename_tab(pane_id: str, event: str) -> None:
     run_quiet(["herdr", "tab", "rename", tab_id, label])
 
 
-def handle_payload(payload: object) -> None:
+def handle_payload(
+    payload: object, summary_agent: str = "copilot", max_chars: int = MAX_SUMMARY_CHARS
+) -> None:
     if not isinstance(payload, dict):
         return
     if os.environ.get("HERDR_SUMMARIZE_ACTIVE"):
@@ -515,7 +540,7 @@ def handle_payload(payload: object) -> None:
     if event in {"UserPromptSubmit", "userPromptSubmit"} or (
         event == "" and not has_explicit_transcript_path and isinstance(payload.get("prompt"), str)
     ):
-        handle_prompt_submit(payload)
+        handle_prompt_submit(payload, max_chars)
         return
     if event not in {"", "Stop"}:
         return
@@ -524,11 +549,21 @@ def handle_payload(payload: object) -> None:
         return
 
     records = read_jsonl(transcript_path)
-    agent = detect_agent_from_records(records)
-    if event == "" and agent not in {"codex", "copilot"}:
+    source_agent = detect_agent_from_records(records)
+    if event == "" and source_agent not in {"codex", "copilot"}:
         return
 
-    handle_stop_event(records, agent)
+    handle_stop_event(records, source_agent, summary_agent, max_chars)
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: {value!r}") from None
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be 1 or greater")
+    return parsed
 
 
 def load_payload_from_stdin() -> dict:
@@ -550,7 +585,17 @@ def load_payload_from_stdin() -> dict:
 
 
 def main() -> None:
-    handle_payload(load_payload_from_stdin())
+    parser = argparse.ArgumentParser(description="Report prompts and summaries from automatically detected agent transcripts.")
+    parser.add_argument(
+        "--agent", choices=("claude", "codex", "copilot"), default="copilot",
+        help="CLI used to generate summaries (default: copilot); transcript format is detected automatically",
+    )
+    parser.add_argument(
+        "--max-chars", type=positive_int, default=MAX_SUMMARY_CHARS,
+        help=f"maximum number of characters in the reported summary (default: {MAX_SUMMARY_CHARS})",
+    )
+    args = parser.parse_args()
+    handle_payload(load_payload_from_stdin(), args.agent, args.max_chars)
 
 
 if __name__ == "__main__":
